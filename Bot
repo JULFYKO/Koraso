@@ -1,0 +1,137 @@
+import os
+import random
+import json
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.dispatcher import FSMContext
+from dotenv import load_dotenv
+
+load_dotenv()  # Завантаження токена з .env
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# Тимчасове сховище фотографій
+user_sessions = {}
+
+class TournamentState(StatesGroup):
+    uploading = State()
+    voting = State()
+
+def generate_keyboard():
+    return InlineKeyboardMarkup().add(
+        InlineKeyboardButton("⬅️ Ліва", callback_data="left"),
+        InlineKeyboardButton("➡️ Права", callback_data="right")
+    )
+
+def undo_keyboard():
+    return InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Скасувати", callback_data="undo"))
+
+@dp.message_handler(commands=["start"])
+async def start_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_sessions[message.chat.id] = {"photos": [], "history": [], "winners": []}
+    await message.answer("📸 Надішліть мені фото для турніру. Коли будете готові, напишіть /done.")
+
+@dp.message_handler(commands=["done"], state="*")
+async def start_tournament(message: types.Message, state: FSMContext):
+    session = user_sessions.get(message.chat.id, {})
+    photos = session.get("photos", [])
+
+    if len(photos) < 2:
+        await message.answer("❌ Потрібно мінімум 2 фото для турніру!")
+        return
+
+    random.shuffle(photos)
+    session["winners"] = []
+    session["history"] = []
+    session["round"] = 1
+    session["match_index"] = 0
+    await state.set_state(TournamentState.voting)
+    await send_next_match(message.chat.id)
+
+@dp.message_handler(content_types=types.ContentType.PHOTO, state="*")
+async def photo_handler(message: types.Message):
+    user_id = message.chat.id
+    file_id = message.photo[-1].file_id  
+    session = user_sessions.setdefault(user_id, {"photos": [], "history": [], "winners": []})
+    session["photos"].append(file_id)
+    await message.answer(f"✅ Фото додано! Загалом: {len(session['photos'])}")
+
+async def send_next_match(chat_id):
+    session = user_sessions.get(chat_id, {})
+    match_index = session["match_index"]
+    photos = session["photos"]
+
+    if match_index * 2 >= len(photos):  
+        if len(photos) % 2 == 1:
+            session["winners"].append(photos[-1])
+        if len(session["winners"]) == 1:
+            await send_winner(chat_id)
+            return
+        session["photos"] = session["winners"]
+        session["winners"] = []
+        session["match_index"] = 0
+        session["round"] += 1
+        await send_next_match(chat_id)
+        return
+
+    left_photo, right_photo = photos[match_index * 2: match_index * 2 + 2]
+    session["current_pair"] = (left_photo, right_photo)
+
+    await bot.send_photo(chat_id, left_photo, caption=f"⚔️ Раунд {session['round']}, матч {match_index + 1}",
+                         reply_markup=generate_keyboard())
+    await bot.send_photo(chat_id, right_photo, caption="Обирайте краще фото ⬆️", reply_markup=undo_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data in ["left", "right", "undo"], state=TournamentState.voting)
+async def process_vote(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.message.chat.id
+    session = user_sessions.get(user_id, {})
+
+    if callback_query.data == "undo":
+        if session["history"]:
+            session["photos"] = session["history"].pop()
+            session["match_index"] -= 1
+            await callback_query.answer("↩️ Вибір скасовано")
+            await send_next_match(user_id)
+        else:
+            await callback_query.answer("❌ Немає дій для скасування")
+        return
+
+    winner_photo = session["current_pair"][0] if callback_query.data == "left" else session["current_pair"][1]
+    session["winners"].append(winner_photo)
+    session["history"].append(session["photos"].copy())  
+    session["match_index"] += 1
+
+    await callback_query.answer("✅ Вибір прийнято")
+    await send_next_match(user_id)
+
+async def send_winner(chat_id):
+    session = user_sessions.get(chat_id, {})
+    winner_photo = session["photos"][0]
+    await bot.send_photo(chat_id, winner_photo, caption="🏆 Найкраще фото турніру!")
+    save_results(chat_id, session)
+    del user_sessions[chat_id]  
+
+def save_results(chat_id, session):
+    filename = f"tournament_{chat_id}.json"
+    data = {
+        "winner": session["photos"][0],
+        "rounds": session["round"],
+        "history": session["history"]
+    }
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+@dp.message_handler(commands=["restart"])
+async def restart_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_sessions.pop(message.chat.id, None)
+    await message.answer("🔄 Турнір перезапущено. Надішліть нові фото!")
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
